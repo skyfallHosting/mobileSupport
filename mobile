@@ -76,12 +76,18 @@ local function roundValue(raw, rounding)
 	return math.floor(raw * mult + 0.5) / mult
 end
 
-local function getToggleContainer(toggle)
-	if toggle.Container and typeof(toggle.Container) == "Instance" then
-		return toggle.Container
-	end
+-- toggle.Container is the GROUPBOX (too large for hit-testing).
+-- The actual row frame is TextLabel -> ToggleInner -> ToggleOuter.
+local function getToggleHitFrame(toggle)
 	if toggle.TextLabel and typeof(toggle.TextLabel) == "Instance" then
-		return toggle.TextLabel.Parent
+		local inner = toggle.TextLabel.Parent
+		if inner and typeof(inner) == "Instance" and inner:IsA("GuiObject") then
+			local outer = inner.Parent
+			if outer and typeof(outer) == "Instance" and outer:IsA("GuiObject") then
+				return outer
+			end
+			return inner
+		end
 	end
 	return nil
 end
@@ -216,55 +222,74 @@ local function findTabButtons(outerFrame)
 
 	for _, desc in ipairs(outerFrame:GetDescendants()) do
 		if desc:IsA("Frame") or desc:IsA("TextButton") or desc:IsA("TextLabel") then
-			local ok, data = pcall(function()
-				local relY = desc.AbsolutePosition.Y - outerAP.Y
-				local h = desc.AbsoluteSize.Y
-				local w = desc.AbsoluteSize.X
-				return relY, h, w
+			local ok, relY, h, w = pcall(function()
+				return desc.AbsolutePosition.Y - outerAP.Y,
+				       desc.AbsoluteSize.Y,
+				       desc.AbsoluteSize.X
 			end)
-			if ok then
-				local relY, h, w = data, 0, 0
-				pcall(function()
-					relY = desc.AbsolutePosition.Y - outerAP.Y
-					h = desc.AbsoluteSize.Y
-					w = desc.AbsoluteSize.X
-				end)
-				if relY > 15 and relY < 70 and h > 10 and h < 40 and w > 30 and w < 250 then
-					local hasText = false
-					if desc:IsA("TextLabel") or desc:IsA("TextButton") then
-						hasText = desc.Text ~= ""
-					else
-						local label = desc:FindFirstChildWhichIsA("TextLabel")
-						if label and label.Text ~= "" then hasText = true end
-					end
-					if hasText then
-						table.insert(results, desc)
-					end
+			if ok and relY > 15 and relY < 70 and h > 10 and h < 40 and w > 30 and w < 250 then
+				local hasText = false
+				if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+					hasText = desc.Text ~= ""
+				else
+					local label = desc:FindFirstChildWhichIsA("TextLabel")
+					if label and label.Text ~= "" then hasText = true end
+				end
+				if hasText then
+					table.insert(results, desc)
 				end
 			end
 		end
 	end
 
-	_cachedTabButtons = results
-	return results
+	-- Real tab bars have 2+ buttons sharing a parent; filter out lone title labels
+	local byParent = {}
+	for _, btn in ipairs(results) do
+		local p = btn.Parent
+		if p then
+			if not byParent[p] then byParent[p] = {} end
+			table.insert(byParent[p], btn)
+		end
+	end
+	local filtered = {}
+	for _, group in pairs(byParent) do
+		if #group >= 2 then
+			for _, btn in ipairs(group) do
+				table.insert(filtered, btn)
+			end
+		end
+	end
+
+	_cachedTabButtons = filtered
+	return filtered
 end
 
 local function fireTabClick(tabBtn)
 	local fs = getFiresignal()
-	if fs then
-		pcall(function()
-			fs(tabBtn.InputBegan, {
-				UserInputType = Enum.UserInputType.MouseButton1,
-				Position = Vector3.new(
-					tabBtn.AbsolutePosition.X + tabBtn.AbsoluteSize.X / 2,
-					tabBtn.AbsolutePosition.Y + tabBtn.AbsoluteSize.Y / 2,
-					0
-				)
-			})
-		end)
-		return true
+	if not fs then return false end
+
+	-- LinoriaLib's InputBegan handler is on the tab button Frame, not its TextLabel
+	local target = tabBtn
+	if tabBtn:IsA("TextLabel") then
+		local p = tabBtn.Parent
+		if p and (p:IsA("Frame") or p:IsA("TextButton")) then
+			target = p
+		end
 	end
-	return false
+
+	local fired = false
+	pcall(function()
+		fs(target.InputBegan, {
+			UserInputType = Enum.UserInputType.MouseButton1,
+			Position = Vector3.new(
+				target.AbsolutePosition.X + target.AbsoluteSize.X / 2,
+				target.AbsolutePosition.Y + target.AbsoluteSize.Y / 2,
+				0
+			)
+		})
+		fired = true
+	end)
+	return fired
 end
 
 -- ═══ GLOBAL TOUCH HANDLER ═══════════════════════════════════════════════
@@ -284,12 +309,12 @@ local function hookGlobalTouch(screenGui)
 		if not outerFrame or not outerFrame.Visible then return end
 		if not isInsideFrame(pos, outerFrame) then return end
 
-		-- 1. check toggles (only visible ones — filters out inactive tabs)
+		-- 1. toggles — hit-test each toggle's individual row frame
 		local toggles = getgenv and getgenv().Toggles
 		if toggles then
-			for _, toggle in pairs(toggles) do
-				local container = getToggleContainer(toggle)
-				if container and isFrameVisible(container) and isInsideFrame(pos, container) then
+			for idx, toggle in pairs(toggles) do
+				local hitFrame = getToggleHitFrame(toggle)
+				if hitFrame and isFrameVisible(hitFrame) and isInsideFrame(pos, hitFrame) then
 					local now = tick()
 					if now - lastToggleTap > 0.3 then
 						lastToggleTap = now
@@ -300,7 +325,7 @@ local function hookGlobalTouch(screenGui)
 			end
 		end
 
-		-- 2. check tabs
+		-- 2. tabs
 		local tabButtons = findTabButtons(outerFrame)
 		for _, tabBtn in ipairs(tabButtons) do
 			if isInsideFrame(pos, tabBtn) then
@@ -309,7 +334,7 @@ local function hookGlobalTouch(screenGui)
 			end
 		end
 
-		-- 3. check window title bar drag (top 55px scaled area)
+		-- 3. window title bar drag (top 55px)
 		local ap = outerFrame.AbsolutePosition
 		if pos.Y <= ap.Y + 55 then
 			windowDragging = true
