@@ -1,13 +1,5 @@
 -- ════════════════════════════════════════════════════════════════════════
 -- MobileSupport.lua — Drop-in mobile/touch layer for LinoriaLib scripts
---
--- Usage (at the end of any LinoriaLib script, after all UI is built):
---
---   local MobileSupport = loadstring(game:HttpGet("your-host/MobileSupport.lua"))()
---   MobileSupport.Init(Library)
---
--- Or paste this file inline and call MobileSupport.Init(Library).
--- On PC/mouse devices this module does nothing.
 -- ════════════════════════════════════════════════════════════════════════
 
 local MobileSupport = {}
@@ -63,6 +55,8 @@ local function findFrameUpvalues(func)
 	return frames
 end
 
+local OVERLAY_ZINDEX = 999
+
 local function createOverlay(parent, name, sizeOverride, posOverride)
 	if not parent then return nil end
 	local overlay = Instance.new("TextButton")
@@ -70,7 +64,7 @@ local function createOverlay(parent, name, sizeOverride, posOverride)
 	overlay.Text = ""
 	overlay.BackgroundTransparency = 1
 	overlay.BorderSizePixel = 0
-	overlay.ZIndex = 100
+	overlay.ZIndex = OVERLAY_ZINDEX
 	overlay.AutoButtonColor = false
 	overlay.Active = true
 	overlay.Size = sizeOverride or UDim2.new(1, 0, 1, 0)
@@ -98,6 +92,15 @@ local function getToggleContainer(toggle)
 	return nil
 end
 
+local function findOuterFrame(screenGui)
+	for _, child in ipairs(screenGui:GetChildren()) do
+		if child:IsA("Frame") then
+			return child
+		end
+	end
+	return nil
+end
+
 -- ═══ UI SCALE ═══════════════════════════════════════════════════════════
 
 local _scaleInstance = nil
@@ -107,16 +110,14 @@ local function applyScale(screenGui)
 	if not ok then return end
 	local factor = viewport.X < 700 and 1.5 or 1.25
 
-	for _, child in ipairs(screenGui:GetChildren()) do
-		if child:IsA("Frame") then
-			if _scaleInstance then
-				pcall(function() _scaleInstance:Destroy() end)
-			end
-			_scaleInstance = Instance.new("UIScale")
-			_scaleInstance.Scale = factor
-			_scaleInstance.Parent = child
-			break
+	local outerFrame = findOuterFrame(screenGui)
+	if outerFrame then
+		if _scaleInstance then
+			pcall(function() _scaleInstance:Destroy() end)
 		end
+		_scaleInstance = Instance.new("UIScale")
+		_scaleInstance.Scale = factor
+		_scaleInstance.Parent = outerFrame
 	end
 
 	return factor
@@ -134,7 +135,8 @@ local function hookToggles()
 			local overlay = createOverlay(container, "MO_T_" .. tostring(idx))
 			if overlay then
 				local lastTap = 0
-				overlay.Activated:Connect(function()
+				overlay.InputBegan:Connect(function(input)
+					if not isTouchOrClick(input) then return end
 					local now = tick()
 					if now - lastTap < 0.25 then return end
 					lastTap = now
@@ -169,7 +171,9 @@ local function findSliderBar(slider)
 	end
 
 	local container = slider.Container
-		or (slider.TextLabel and typeof(slider.TextLabel) == "Instance" and slider.TextLabel.Parent)
+	if not container and slider.TextLabel and typeof(slider.TextLabel) == "Instance" then
+		container = slider.TextLabel.Parent
+	end
 	if container and typeof(container) == "Instance" then
 		for _, desc in ipairs(container:GetDescendants()) do
 			if desc:IsA("Frame") and desc.AbsoluteSize.Y < 25 and desc.AbsoluteSize.X > 80 then
@@ -196,7 +200,7 @@ local function hookSliders()
 
 	for idx, element in pairs(options) do
 		if not element.Type or element.Type ~= "Slider" then
-			-- skip non-sliders
+			-- skip
 		else
 			local bar = findSliderBar(element)
 			if bar then
@@ -274,7 +278,8 @@ local function hookDropdowns()
 			if header then
 				local overlay = createOverlay(header, "MO_D_" .. tostring(idx))
 				if overlay then
-					overlay.Activated:Connect(function()
+					overlay.InputBegan:Connect(function(input)
+						if not isTouchOrClick(input) then return end
 						pcall(function()
 							if element.OpenDropdown then
 								element:OpenDropdown()
@@ -309,7 +314,8 @@ local function hookDropdowns()
 							and not child:FindFirstChild("MO_DI") then
 							local itemOverlay = createOverlay(child, "MO_DI")
 							if itemOverlay then
-								itemOverlay.Activated:Connect(function()
+								itemOverlay.InputBegan:Connect(function(input)
+									if not isTouchOrClick(input) then return end
 									local text = nil
 									if child:IsA("TextLabel") or child:IsA("TextButton") then
 										text = child.Text
@@ -356,13 +362,7 @@ end
 -- ═══ WINDOW DRAG ════════════════════════════════════════════════════════
 
 local function hookWindowDrag(screenGui)
-	local outerFrame = nil
-	for _, child in ipairs(screenGui:GetChildren()) do
-		if child:IsA("Frame") and child.Visible and child.BackgroundTransparency < 1 then
-			outerFrame = child
-			break
-		end
-	end
+	local outerFrame = findOuterFrame(screenGui)
 	if not outerFrame then return end
 
 	local dragOverlay = createOverlay(
@@ -414,7 +414,7 @@ local function addMenuToggleButton(Library, screenGui)
 	btn.BackgroundTransparency = 0.25
 	btn.Size = UDim2.new(0, 46, 0, 46)
 	btn.Position = UDim2.new(0, 12, 0.5, -23)
-	btn.ZIndex = 200
+	btn.ZIndex = OVERLAY_ZINDEX + 1
 	btn.AutoButtonColor = false
 	btn.Active = true
 	btn.BorderSizePixel = 0
@@ -446,6 +446,19 @@ local function addMenuToggleButton(Library, screenGui)
 		end
 	end)
 
+	btn.InputEnded:Connect(function(input)
+		if isTouchOrClick(input) then
+			if not wasDragged then
+				local outerFrame = findOuterFrame(screenGui)
+				if outerFrame then
+					outerFrame.Visible = not outerFrame.Visible
+				end
+			end
+			wasDragged = false
+			dragStart = nil
+		end
+	end)
+
 	addConn(UIS.InputChanged:Connect(function(input)
 		if dragStart and isTouchOrMouseMove(input) then
 			local delta = input.Position - dragStart
@@ -458,25 +471,6 @@ local function addMenuToggleButton(Library, screenGui)
 			end
 		end
 	end))
-
-	btn.Activated:Connect(function()
-		if wasDragged then
-			wasDragged = false
-			dragStart = nil
-			return
-		end
-		dragStart = nil
-		local outerFrame = nil
-		for _, child in ipairs(screenGui:GetChildren()) do
-			if child:IsA("Frame") then
-				outerFrame = child
-				break
-			end
-		end
-		if outerFrame then
-			outerFrame.Visible = not outerFrame.Visible
-		end
-	end)
 end
 
 -- ═══ VIEWPORT CHANGE HANDLER ════════════════════════════════════════════
