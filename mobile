@@ -36,19 +36,6 @@ local function isTouchOrMouseMove(input)
 	return t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseMovement
 end
 
-local function isFrameVisible(frame)
-	if not frame then return false end
-	local current = frame
-	while current do
-		if current:IsA("GuiObject") then
-			if not current.Visible then return false end
-		end
-		if current:IsA("BasePlayerGui") or current:IsA("CoreGui") then break end
-		current = current.Parent
-	end
-	return true
-end
-
 local function isInsideFrame(pos, frame)
 	if not frame then return false end
 	local ap = frame.AbsolutePosition
@@ -76,22 +63,6 @@ local function roundValue(raw, rounding)
 	return math.floor(raw * mult + 0.5) / mult
 end
 
--- toggle.Container is the GROUPBOX (too large for hit-testing).
--- The actual row frame is TextLabel -> ToggleInner -> ToggleOuter.
-local function getToggleHitFrame(toggle)
-	if toggle.TextLabel and typeof(toggle.TextLabel) == "Instance" then
-		local inner = toggle.TextLabel.Parent
-		if inner and typeof(inner) == "Instance" and inner:IsA("GuiObject") then
-			local outer = inner.Parent
-			if outer and typeof(outer) == "Instance" and outer:IsA("GuiObject") then
-				return outer
-			end
-			return inner
-		end
-	end
-	return nil
-end
-
 local function findOuterFrame(screenGui)
 	for _, child in ipairs(screenGui:GetChildren()) do
 		if child:IsA("Frame") then return child end
@@ -113,6 +84,55 @@ local function applyScale(screenGui)
 		_scaleInstance = Instance.new("UIScale")
 		_scaleInstance.Scale = factor
 		_scaleInstance.Parent = outerFrame
+	end
+end
+
+-- ═══ TOGGLE SUPPORT (overlay approach — same pattern as working sliders) ═
+
+local function hookToggles()
+	local toggles = getgenv and getgenv().Toggles
+	if not toggles then return end
+
+	for idx, toggle in pairs(toggles) do
+		-- ToggleOuter (13x13 checkbox) = TextLabel.Parent (ToggleInner).Parent
+		local outer = nil
+		if toggle.TextLabel and typeof(toggle.TextLabel) == "Instance" then
+			local inner = toggle.TextLabel.Parent
+			if inner and typeof(inner) == "Instance" and inner:IsA("GuiObject") then
+				local candidate = inner.Parent
+				if candidate and typeof(candidate) == "Instance" and candidate:IsA("GuiObject") then
+					outer = candidate
+				end
+			end
+		end
+
+		if outer then
+			local overlay = Instance.new("TextButton")
+			overlay.Name = "MO_T_" .. tostring(idx)
+			overlay.Text = ""
+			overlay.BackgroundTransparency = 1
+			overlay.BorderSizePixel = 0
+			overlay.ZIndex = 999
+			overlay.AutoButtonColor = false
+			overlay.Active = true
+			-- ToggleOuter is 13x13; label extends ~220px right.
+			-- Cover the full row: wider + taller than the 13px checkbox.
+			overlay.Size = UDim2.new(0, 220, 0, 22)
+			overlay.Position = UDim2.new(0, -4, 0.5, -11)
+			overlay.Parent = outer
+			addOverlay(overlay)
+
+			local lastTap = 0
+			overlay.InputBegan:Connect(function(input)
+				if isTouchOrClick(input) then
+					local now = tick()
+					if now - lastTap > 0.3 then
+						lastTap = now
+						pcall(function() toggle:SetValue(not toggle.Value) end)
+					end
+				end
+			end)
+		end
 	end
 end
 
@@ -242,7 +262,7 @@ local function findTabButtons(outerFrame)
 		end
 	end
 
-	-- Real tab bars have 2+ buttons sharing a parent; filter out lone title labels
+	-- Real tab bars have 2+ buttons sharing a parent; filters out title label
 	local byParent = {}
 	for _, btn in ipairs(results) do
 		local p = btn.Parent
@@ -292,10 +312,11 @@ local function fireTabClick(tabBtn)
 	return fired
 end
 
--- ═══ GLOBAL TOUCH HANDLER ═══════════════════════════════════════════════
+-- ═══ WINDOW DRAG & TAB HANDLER ═════════════════════════════════════════
+-- Toggles/sliders are handled by their own overlay buttons.
+-- This handler only deals with tabs and window dragging.
 
-local function hookGlobalTouch(screenGui)
-	local lastToggleTap = 0
+local function hookWindowAndTabs(screenGui)
 	local windowDragging = false
 	local windowDragStart = nil
 	local windowStartPos = nil
@@ -309,23 +330,7 @@ local function hookGlobalTouch(screenGui)
 		if not outerFrame or not outerFrame.Visible then return end
 		if not isInsideFrame(pos, outerFrame) then return end
 
-		-- 1. toggles — hit-test each toggle's individual row frame
-		local toggles = getgenv and getgenv().Toggles
-		if toggles then
-			for idx, toggle in pairs(toggles) do
-				local hitFrame = getToggleHitFrame(toggle)
-				if hitFrame and isFrameVisible(hitFrame) and isInsideFrame(pos, hitFrame) then
-					local now = tick()
-					if now - lastToggleTap > 0.3 then
-						lastToggleTap = now
-						pcall(function() toggle:SetValue(not toggle.Value) end)
-					end
-					return
-				end
-			end
-		end
-
-		-- 2. tabs
+		-- 1. tabs (in header area)
 		local tabButtons = findTabButtons(outerFrame)
 		for _, tabBtn in ipairs(tabButtons) do
 			if isInsideFrame(pos, tabBtn) then
@@ -334,7 +339,7 @@ local function hookGlobalTouch(screenGui)
 			end
 		end
 
-		-- 3. window title bar drag (top 55px)
+		-- 2. window title bar drag (top 55px)
 		local ap = outerFrame.AbsolutePosition
 		if pos.Y <= ap.Y + 55 then
 			windowDragging = true
@@ -395,18 +400,18 @@ local function addMenuToggleButton(screenGui)
 		stroke.Parent = btn
 	end)
 
+	-- Drag + tap using same pattern as INVIS HUB (proven on mobile)
 	local btnDragStart = nil
 	local btnStartPos = nil
 	local btnWasDragged = false
 
-	addConn(UIS.InputBegan:Connect(function(input)
-		if not isTouchOrClick(input) then return end
-		if isInsideFrame(input.Position, btn) then
+	btn.InputBegan:Connect(function(input)
+		if isTouchOrClick(input) then
 			btnDragStart = input.Position
 			btnStartPos = btn.Position
 			btnWasDragged = false
 		end
-	end))
+	end)
 
 	addConn(UIS.InputChanged:Connect(function(input)
 		if btnDragStart and isTouchOrMouseMove(input) then
@@ -422,15 +427,16 @@ local function addMenuToggleButton(screenGui)
 	end))
 
 	addConn(UIS.InputEnded:Connect(function(input)
-		if not isTouchOrClick(input) then return end
-		if btnDragStart and not btnWasDragged then
-			local outerFrame = findOuterFrame(screenGui)
-			if outerFrame then
-				outerFrame.Visible = not outerFrame.Visible
+		if isTouchOrClick(input) then
+			if btnDragStart and not btnWasDragged then
+				local outerFrame = findOuterFrame(screenGui)
+				if outerFrame then
+					outerFrame.Visible = not outerFrame.Visible
+				end
 			end
+			btnDragStart = nil
+			btnWasDragged = false
 		end
-		btnDragStart = nil
-		btnWasDragged = false
 	end))
 end
 
@@ -460,9 +466,10 @@ function MobileSupport.Init(Library)
 	pcall(applyScale, screenGui)
 	task.wait(0.15)
 
+	pcall(hookToggles)
 	pcall(hookSliders)
 	pcall(hideKeybinds)
-	pcall(hookGlobalTouch, screenGui)
+	pcall(hookWindowAndTabs, screenGui)
 	pcall(addMenuToggleButton, screenGui)
 	pcall(watchViewport, screenGui)
 end
