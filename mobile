@@ -134,11 +134,11 @@ local function hookToggles()
 			local overlay = createOverlay(container, "MO_T_" .. tostring(idx))
 			if overlay then
 				local lastTap = 0
-				overlay.MouseButton1Click:Connect(function()
+				overlay.Activated:Connect(function()
 					local now = tick()
 					if now - lastTap < 0.25 then return end
 					lastTap = now
-					pcall(function() toggle:SetValue(not toggle.Value) end)
+					toggle:SetValue(not toggle.Value)
 				end)
 			end
 		end
@@ -274,7 +274,7 @@ local function hookDropdowns()
 			if header then
 				local overlay = createOverlay(header, "MO_D_" .. tostring(idx))
 				if overlay then
-					overlay.MouseButton1Click:Connect(function()
+					overlay.Activated:Connect(function()
 						pcall(function()
 							if element.OpenDropdown then
 								element:OpenDropdown()
@@ -309,7 +309,7 @@ local function hookDropdowns()
 							and not child:FindFirstChild("MO_DI") then
 							local itemOverlay = createOverlay(child, "MO_DI")
 							if itemOverlay then
-								itemOverlay.MouseButton1Click:Connect(function()
+								itemOverlay.Activated:Connect(function()
 									local text = nil
 									if child:IsA("TextLabel") or child:IsA("TextButton") then
 										text = child.Text
@@ -434,50 +434,49 @@ local function addMenuToggleButton(Library, screenGui)
 		stroke.Parent = btn
 	end)
 
-	local dragging = false
 	local dragStart = nil
 	local startPos = nil
-	local dragDelta = 0
+	local wasDragged = false
 
 	btn.InputBegan:Connect(function(input)
 		if isTouchOrClick(input) then
-			dragging = true
 			dragStart = input.Position
 			startPos = btn.Position
-			dragDelta = 0
-		end
-	end)
-
-	btn.InputEnded:Connect(function(input)
-		if isTouchOrClick(input) then
-			if dragDelta < 12 then
-				pcall(function()
-					local outerFrame = nil
-					for _, child in ipairs(screenGui:GetChildren()) do
-						if child:IsA("Frame") then
-							outerFrame = child
-							break
-						end
-					end
-					if outerFrame then
-						outerFrame.Visible = not outerFrame.Visible
-					end
-				end)
-			end
-			dragging = false
+			wasDragged = false
 		end
 	end)
 
 	addConn(UIS.InputChanged:Connect(function(input)
-		if dragging and isTouchOrMouseMove(input) and dragStart then
+		if dragStart and isTouchOrMouseMove(input) then
 			local delta = input.Position - dragStart
-			dragDelta = delta.Magnitude
-			btn.Position = UDim2.new(
-				startPos.X.Scale, startPos.X.Offset + delta.X,
-				startPos.Y.Scale, startPos.Y.Offset + delta.Y
-			)
+			if delta.Magnitude > 10 then
+				wasDragged = true
+				btn.Position = UDim2.new(
+					startPos.X.Scale, startPos.X.Offset + delta.X,
+					startPos.Y.Scale, startPos.Y.Offset + delta.Y
+				)
+			end
 		end
 	end))
+
+	btn.Activated:Connect(function()
+		if wasDragged then
+			wasDragged = false
+			dragStart = nil
+			return
+		end
+		dragStart = nil
+		local outerFrame = nil
+		for _, child in ipairs(screenGui:GetChildren()) do
+			if child:IsA("Frame") then
+				outerFrame = child
+				break
+			end
+		end
+		if outerFrame then
+			outerFrame.Visible = not outerFrame.Visible
+		end
+	end)
 end
 
 -- ═══ VIEWPORT CHANGE HANDLER ════════════════════════════════════════════
