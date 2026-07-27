@@ -36,8 +36,21 @@ local function isTouchOrMouseMove(input)
 	return t == Enum.UserInputType.Touch or t == Enum.UserInputType.MouseMovement
 end
 
+local function isFrameVisible(frame)
+	if not frame then return false end
+	local current = frame
+	while current do
+		if current:IsA("GuiObject") then
+			if not current.Visible then return false end
+		end
+		if current:IsA("BasePlayerGui") or current:IsA("CoreGui") then break end
+		current = current.Parent
+	end
+	return true
+end
+
 local function isInsideFrame(pos, frame)
-	if not frame or not frame.Visible then return false end
+	if not frame then return false end
 	local ap = frame.AbsolutePosition
 	local as = frame.AbsoluteSize
 	return pos.X >= ap.X and pos.X <= ap.X + as.X
@@ -183,9 +196,78 @@ local function hideKeybinds()
 	end
 end
 
--- ═══ GLOBAL TOUCH HANDLER (toggles + window drag) ═══════════════════════
--- Bypasses overlay approach entirely — reads touch position from
--- UserInputService and hit-tests against known element bounds.
+-- ═══ TAB SUPPORT ════════════════════════════════════════════════════════
+
+local _cachedTabButtons = nil
+local _firesignal = nil
+
+local function getFiresignal()
+	if _firesignal ~= nil then return _firesignal end
+	_firesignal = firesignal
+		or (getgenv and getgenv().firesignal)
+		or false
+	return _firesignal
+end
+
+local function findTabButtons(outerFrame)
+	if _cachedTabButtons then return _cachedTabButtons end
+	local results = {}
+	local outerAP = outerFrame.AbsolutePosition
+
+	for _, desc in ipairs(outerFrame:GetDescendants()) do
+		if desc:IsA("Frame") or desc:IsA("TextButton") or desc:IsA("TextLabel") then
+			local ok, data = pcall(function()
+				local relY = desc.AbsolutePosition.Y - outerAP.Y
+				local h = desc.AbsoluteSize.Y
+				local w = desc.AbsoluteSize.X
+				return relY, h, w
+			end)
+			if ok then
+				local relY, h, w = data, 0, 0
+				pcall(function()
+					relY = desc.AbsolutePosition.Y - outerAP.Y
+					h = desc.AbsoluteSize.Y
+					w = desc.AbsoluteSize.X
+				end)
+				if relY > 15 and relY < 70 and h > 10 and h < 40 and w > 30 and w < 250 then
+					local hasText = false
+					if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+						hasText = desc.Text ~= ""
+					else
+						local label = desc:FindFirstChildWhichIsA("TextLabel")
+						if label and label.Text ~= "" then hasText = true end
+					end
+					if hasText then
+						table.insert(results, desc)
+					end
+				end
+			end
+		end
+	end
+
+	_cachedTabButtons = results
+	return results
+end
+
+local function fireTabClick(tabBtn)
+	local fs = getFiresignal()
+	if fs then
+		pcall(function()
+			fs(tabBtn.InputBegan, {
+				UserInputType = Enum.UserInputType.MouseButton1,
+				Position = Vector3.new(
+					tabBtn.AbsolutePosition.X + tabBtn.AbsoluteSize.X / 2,
+					tabBtn.AbsolutePosition.Y + tabBtn.AbsoluteSize.Y / 2,
+					0
+				)
+			})
+		end)
+		return true
+	end
+	return false
+end
+
+-- ═══ GLOBAL TOUCH HANDLER ═══════════════════════════════════════════════
 
 local function hookGlobalTouch(screenGui)
 	local lastToggleTap = 0
@@ -202,12 +284,12 @@ local function hookGlobalTouch(screenGui)
 		if not outerFrame or not outerFrame.Visible then return end
 		if not isInsideFrame(pos, outerFrame) then return end
 
-		-- check toggles first
+		-- 1. check toggles (only visible ones — filters out inactive tabs)
 		local toggles = getgenv and getgenv().Toggles
 		if toggles then
 			for _, toggle in pairs(toggles) do
 				local container = getToggleContainer(toggle)
-				if container and isInsideFrame(pos, container) then
+				if container and isFrameVisible(container) and isInsideFrame(pos, container) then
 					local now = tick()
 					if now - lastToggleTap > 0.3 then
 						lastToggleTap = now
@@ -218,41 +300,23 @@ local function hookGlobalTouch(screenGui)
 			end
 		end
 
-		-- check dropdown headers
-		local options = getgenv and getgenv().Options
-		if options then
-			for _, element in pairs(options) do
-				if element.Type and element.Type == "Dropdown" then
-					pcall(function()
-						if _getupvalues then
-							local methodsToTry = { "OpenDropdown", "CloseDropdown", "BuildDropdownList" }
-							for _, methodName in ipairs(methodsToTry) do
-								if element[methodName] then
-									local frames = findFrameUpvalues(element[methodName])
-									for _, f in ipairs(frames) do
-										if f:IsA("Frame") and isInsideFrame(pos, f)
-											and f.AbsoluteSize.Y < 40 and f.AbsoluteSize.X > 60 then
-											if element.OpenDropdown then
-												element:OpenDropdown()
-											end
-											return
-										end
-									end
-								end
-							end
-						end
-					end)
-				end
+		-- 2. check tabs
+		local tabButtons = findTabButtons(outerFrame)
+		for _, tabBtn in ipairs(tabButtons) do
+			if isInsideFrame(pos, tabBtn) then
+				fireTabClick(tabBtn)
+				return
 			end
 		end
 
-		-- check window title bar drag (top 32px)
+		-- 3. check window title bar drag (top 55px scaled area)
 		local ap = outerFrame.AbsolutePosition
-		if pos.Y <= ap.Y + 32 then
+		if pos.Y <= ap.Y + 55 then
 			windowDragging = true
 			windowDragStart = pos
 			windowStartPos = outerFrame.Position
 			windowDragFrame = outerFrame
+			return
 		end
 	end))
 
@@ -306,7 +370,6 @@ local function addMenuToggleButton(screenGui)
 		stroke.Parent = btn
 	end)
 
-	-- Use global hit-test for the button too
 	local btnDragStart = nil
 	local btnStartPos = nil
 	local btnWasDragged = false
@@ -381,6 +444,7 @@ end
 
 function MobileSupport.Destroy()
 	_initialized = false
+	_cachedTabButtons = nil
 	for _, conn in ipairs(_connections) do
 		pcall(function() conn:Disconnect() end)
 	end
