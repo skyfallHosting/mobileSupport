@@ -1,5 +1,8 @@
 -- ════════════════════════════════════════════════════════════════════════
 -- MobileSupport.lua — Drop-in mobile/touch layer for LinoriaLib scripts
+-- Uses the same input patterns proven working by INVIS HUB on mobile:
+--   TextButton overlays with MouseButton1Click + InputBegan:Touch
+--   Per-frame InputBegan for drag (not global hit-testing)
 -- ════════════════════════════════════════════════════════════════════════
 
 local MobileSupport = {}
@@ -87,26 +90,30 @@ local function applyScale(screenGui)
 	end
 end
 
--- ═══ TOGGLE SUPPORT (overlay approach — same pattern as working sliders) ═
+-- ═══ TOGGLE SUPPORT ════════════════════════════════════════════════════
+-- LinoriaLib's toggles check MouseButton1 in InputBegan — Touch never fires.
+-- Fix: overlay TextButton on each toggle's TextLabel.
+-- TextLabel is 216px wide (biggest hit target in the toggle row).
+-- Overlay extends vertically for easier tapping.
+-- Uses BOTH MouseButton1Click AND InputBegan:Touch for maximum compat.
 
 local function hookToggles()
 	local toggles = getgenv and getgenv().Toggles
 	if not toggles then return end
 
 	for idx, toggle in pairs(toggles) do
-		-- ToggleOuter (13x13 checkbox) = TextLabel.Parent (ToggleInner).Parent
-		local outer = nil
 		if toggle.TextLabel and typeof(toggle.TextLabel) == "Instance" then
-			local inner = toggle.TextLabel.Parent
-			if inner and typeof(inner) == "Instance" and inner:IsA("GuiObject") then
-				local candidate = inner.Parent
-				if candidate and typeof(candidate) == "Instance" and candidate:IsA("GuiObject") then
-					outer = candidate
+			local label = toggle.TextLabel
+			local lastTap = 0
+
+			local function tryToggle()
+				local now = tick()
+				if now - lastTap > 0.3 then
+					lastTap = now
+					pcall(function() toggle:SetValue(not toggle.Value) end)
 				end
 			end
-		end
 
-		if outer then
 			local overlay = Instance.new("TextButton")
 			overlay.Name = "MO_T_" .. tostring(idx)
 			overlay.Text = ""
@@ -115,21 +122,19 @@ local function hookToggles()
 			overlay.ZIndex = 999
 			overlay.AutoButtonColor = false
 			overlay.Active = true
-			-- ToggleOuter is 13x13; label extends ~220px right.
-			-- Cover the full row: wider + taller than the 13px checkbox.
-			overlay.Size = UDim2.new(0, 220, 0, 22)
-			overlay.Position = UDim2.new(0, -4, 0.5, -11)
-			overlay.Parent = outer
+			-- Cover label width + extra vertical padding for fat-finger touch
+			overlay.Size = UDim2.new(1, 10, 0, 28)
+			overlay.Position = UDim2.new(0, -5, 0.5, -14)
+			overlay.Parent = label
 			addOverlay(overlay)
 
-			local lastTap = 0
+			-- MouseButton1Click fires for touch taps on TextButtons (proven by INVIS HUB)
+			overlay.MouseButton1Click:Connect(tryToggle)
+
+			-- Backup: direct Touch InputBegan (proven by slider overlays)
 			overlay.InputBegan:Connect(function(input)
-				if isTouchOrClick(input) then
-					local now = tick()
-					if now - lastTap > 0.3 then
-						lastTap = now
-						pcall(function() toggle:SetValue(not toggle.Value) end)
-					end
+				if input.UserInputType == Enum.UserInputType.Touch then
+					tryToggle()
 				end
 			end)
 		end
@@ -222,10 +227,12 @@ local function hideKeybinds()
 	end
 end
 
--- ═══ TAB SUPPORT ════════════════════════════════════════════════════════
+-- ═══ TAB SUPPORT (overlay approach — same pattern as toggles) ═══════════
+-- Tab buttons have variable widths based on text.
+-- Overlay uses UDim2 Scale=1 so it matches any tab button size automatically.
 
-local _cachedTabButtons = nil
 local _firesignal = nil
+local _tabJustClicked = false
 
 local function getFiresignal()
 	if _firesignal ~= nil then return _firesignal end
@@ -235,88 +242,96 @@ local function getFiresignal()
 	return _firesignal
 end
 
-local function findTabButtons(outerFrame)
-	if _cachedTabButtons then return _cachedTabButtons end
-	local results = {}
-	local outerAP = outerFrame.AbsolutePosition
+local function hookTabs(screenGui)
+	local outerFrame = findOuterFrame(screenGui)
+	if not outerFrame then return end
 
-	for _, desc in ipairs(outerFrame:GetDescendants()) do
-		if desc:IsA("Frame") or desc:IsA("TextButton") or desc:IsA("TextLabel") then
-			local ok, relY, h, w = pcall(function()
-				return desc.AbsolutePosition.Y - outerAP.Y,
-				       desc.AbsoluteSize.Y,
-				       desc.AbsoluteSize.X
-			end)
-			if ok and relY > 15 and relY < 70 and h > 10 and h < 40 and w > 30 and w < 250 then
-				local hasText = false
-				if desc:IsA("TextLabel") or desc:IsA("TextButton") then
-					hasText = desc.Text ~= ""
-				else
-					local label = desc:FindFirstChildWhichIsA("TextLabel")
-					if label and label.Text ~= "" then hasText = true end
-				end
-				if hasText then
-					table.insert(results, desc)
-				end
-			end
-		end
-	end
-
-	-- Real tab bars have 2+ buttons sharing a parent; filters out title label
-	local byParent = {}
-	for _, btn in ipairs(results) do
-		local p = btn.Parent
-		if p then
-			if not byParent[p] then byParent[p] = {} end
-			table.insert(byParent[p], btn)
-		end
-	end
-	local filtered = {}
-	for _, group in pairs(byParent) do
-		if #group >= 2 then
-			for _, btn in ipairs(group) do
-				table.insert(filtered, btn)
-			end
-		end
-	end
-
-	_cachedTabButtons = filtered
-	return filtered
-end
-
-local function fireTabClick(tabBtn)
 	local fs = getFiresignal()
-	if not fs then return false end
+	if not fs then return end
 
-	-- LinoriaLib's InputBegan handler is on the tab button Frame, not its TextLabel
-	local target = tabBtn
-	if tabBtn:IsA("TextLabel") then
-		local p = tabBtn.Parent
-		if p and (p:IsA("Frame") or p:IsA("TextButton")) then
-			target = p
+	-- Find the tab button container: a frame with horizontal UIListLayout near the top
+	local tabContainer = nil
+	for _, desc in ipairs(outerFrame:GetDescendants()) do
+		if desc:IsA("UIListLayout") then
+			local ok, fillDir = pcall(function() return desc.FillDirection end)
+			if ok and fillDir == Enum.FillDirection.Horizontal then
+				local parent = desc.Parent
+				if parent and parent:IsA("GuiObject") then
+					local ok2, relY = pcall(function()
+						return parent.AbsolutePosition.Y - outerFrame.AbsolutePosition.Y
+					end)
+					if ok2 and relY >= 0 and relY < 80 then
+						tabContainer = parent
+						break
+					end
+				end
+			end
 		end
 	end
 
-	local fired = false
-	pcall(function()
-		fs(target.InputBegan, {
-			UserInputType = Enum.UserInputType.MouseButton1,
-			Position = Vector3.new(
-				target.AbsolutePosition.X + target.AbsoluteSize.X / 2,
-				target.AbsolutePosition.Y + target.AbsoluteSize.Y / 2,
-				0
-			)
-		})
-		fired = true
-	end)
-	return fired
+	if not tabContainer then return end
+
+	for _, child in ipairs(tabContainer:GetChildren()) do
+		if child:IsA("Frame") or child:IsA("TextButton") then
+			local hasText = false
+			if child:IsA("TextButton") then
+				hasText = child.Text ~= ""
+			else
+				local lbl = child:FindFirstChildWhichIsA("TextLabel")
+				if lbl and lbl.Text ~= "" then hasText = true end
+			end
+
+			if hasText then
+				local tabBtnFrame = child
+				local lastTap = 0
+
+				local function tryTabClick()
+					local now = tick()
+					if now - lastTap > 0.3 then
+						lastTap = now
+						_tabJustClicked = true
+						task.delay(0.15, function() _tabJustClicked = false end)
+						pcall(function()
+							fs(tabBtnFrame.InputBegan, {
+								UserInputType = Enum.UserInputType.MouseButton1,
+								Position = Vector3.new(
+									tabBtnFrame.AbsolutePosition.X + tabBtnFrame.AbsoluteSize.X / 2,
+									tabBtnFrame.AbsolutePosition.Y + tabBtnFrame.AbsoluteSize.Y / 2,
+									0
+								)
+							})
+						end)
+					end
+				end
+
+				local overlay = Instance.new("TextButton")
+				overlay.Name = "MO_Tab"
+				overlay.Text = ""
+				overlay.BackgroundTransparency = 1
+				overlay.BorderSizePixel = 0
+				overlay.ZIndex = 999
+				overlay.AutoButtonColor = false
+				overlay.Active = true
+				-- Fill parent + slight padding; adapts to any tab width
+				overlay.Size = UDim2.new(1, 6, 1, 8)
+				overlay.Position = UDim2.new(0, -3, 0, -4)
+				overlay.Parent = tabBtnFrame
+				addOverlay(overlay)
+
+				overlay.MouseButton1Click:Connect(tryTabClick)
+				overlay.InputBegan:Connect(function(input)
+					if input.UserInputType == Enum.UserInputType.Touch then
+						tryTabClick()
+					end
+				end)
+			end
+		end
+	end
 end
 
--- ═══ WINDOW DRAG & TAB HANDLER ═════════════════════════════════════════
--- Toggles/sliders are handled by their own overlay buttons.
--- This handler only deals with tabs and window dragging.
+-- ═══ WINDOW DRAG ════════════════════════════════════════════════════════
 
-local function hookWindowAndTabs(screenGui)
+local function hookWindowDrag(screenGui)
 	local windowDragging = false
 	local windowDragStart = nil
 	local windowStartPos = nil
@@ -324,29 +339,19 @@ local function hookWindowAndTabs(screenGui)
 
 	addConn(UIS.InputBegan:Connect(function(input)
 		if not isTouchOrClick(input) then return end
+		if _tabJustClicked then return end
 		local pos = input.Position
 
 		local outerFrame = findOuterFrame(screenGui)
 		if not outerFrame or not outerFrame.Visible then return end
 		if not isInsideFrame(pos, outerFrame) then return end
 
-		-- 1. tabs (in header area)
-		local tabButtons = findTabButtons(outerFrame)
-		for _, tabBtn in ipairs(tabButtons) do
-			if isInsideFrame(pos, tabBtn) then
-				fireTabClick(tabBtn)
-				return
-			end
-		end
-
-		-- 2. window title bar drag (top 55px)
 		local ap = outerFrame.AbsolutePosition
 		if pos.Y <= ap.Y + 55 then
 			windowDragging = true
 			windowDragStart = pos
 			windowStartPos = outerFrame.Position
 			windowDragFrame = outerFrame
-			return
 		end
 	end))
 
@@ -369,6 +374,7 @@ local function hookWindowAndTabs(screenGui)
 end
 
 -- ═══ MENU TOGGLE BUTTON ═════════════════════════════════════════════════
+-- Same pattern as INVIS HUB: TextButton with InputBegan for drag + tap
 
 local function addMenuToggleButton(screenGui)
 	local btn = Instance.new("TextButton")
@@ -400,7 +406,6 @@ local function addMenuToggleButton(screenGui)
 		stroke.Parent = btn
 	end)
 
-	-- Drag + tap using same pattern as INVIS HUB (proven on mobile)
 	local btnDragStart = nil
 	local btnStartPos = nil
 	local btnWasDragged = false
@@ -469,14 +474,15 @@ function MobileSupport.Init(Library)
 	pcall(hookToggles)
 	pcall(hookSliders)
 	pcall(hideKeybinds)
-	pcall(hookWindowAndTabs, screenGui)
+	pcall(hookTabs, screenGui)
+	pcall(hookWindowDrag, screenGui)
 	pcall(addMenuToggleButton, screenGui)
 	pcall(watchViewport, screenGui)
 end
 
 function MobileSupport.Destroy()
 	_initialized = false
-	_cachedTabButtons = nil
+	_tabJustClicked = false
 	for _, conn in ipairs(_connections) do
 		pcall(function() conn:Disconnect() end)
 	end
