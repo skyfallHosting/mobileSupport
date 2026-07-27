@@ -1,0 +1,457 @@
+-- ════════════════════════════════════════════════════════════════════════
+-- MobileSupport.lua — Drop-in mobile/touch layer for LinoriaLib scripts
+--
+-- Usage (at the end of any LinoriaLib script, after all UI is built):
+--
+--   local MobileSupport = loadstring(game:HttpGet("your-host/MobileSupport.lua"))()
+--   MobileSupport.Init(Library)
+-- ════════════════════════════════════════════════════════════════════════
+
+local MobileSupport = {}
+
+local UIS = game:GetService("UserInputService")
+local RunService = game:GetService("RunService")
+
+local _overlays = {}
+local _connections = {}
+local _initialized = false
+local _getupvalues = debug.getupvalues or getupvalues
+
+-- ═══ DETECTION ══════════════════════════════════════════════════════════
+
+function MobileSupport.isMobile()
+	return UIS.TouchEnabled and not UIS.MouseEnabled and not UIS.KeyboardEnabled
+end
+
+-- ═══ INTERNAL HELPERS ═══════════════════════════════════════════════════
+
+local function addConn(conn)
+	table.insert(_connections, conn)
+end
+
+local function addOverlay(obj)
+	table.insert(_overlays, obj)
+end
+
+local function findFrameUpvalues(func)
+	if not _getupvalues or not func then return {} end
+	local ok, ups = pcall(_getupvalues, func)
+	if not ok or type(ups) ~= "table" then return {} end
+	local frames = {}
+	for _, v in pairs(ups) do
+		if typeof(v) == "Instance" and v:IsA("Frame") then
+			table.insert(frames, v)
+		end
+	end
+	return frames
+end
+
+local function createOverlay(parent, name, sizeOverride, posOverride)
+	local overlay = Instance.new("TextButton")
+	overlay.Name = name or "MO"
+	overlay.Text = ""
+	overlay.BackgroundTransparency = 1
+	overlay.BorderSizePixel = 0
+	overlay.ZIndex = 100
+	overlay.AutoButtonColor = false
+	overlay.Size = sizeOverride or UDim2.new(1, 0, 1, 0)
+	overlay.Position = posOverride or UDim2.new(0, 0, 0, 0)
+	overlay.Parent = parent
+	addOverlay(overlay)
+	return overlay
+end
+
+local function roundValue(raw, rounding)
+	if rounding == 0 then
+		return math.floor(raw + 0.5)
+	end
+	local mult = 10 ^ rounding
+	return math.floor(raw * mult + 0.5) / mult
+end
+
+-- ═══ UI SCALE ═══════════════════════════════════════════════════════════
+
+local _scaleInstance = nil
+
+local function applyScale(screenGui)
+	local viewport = workspace.CurrentCamera.ViewportSize
+	local factor = viewport.X < 700 and 1.5 or 1.25
+
+	for _, child in ipairs(screenGui:GetChildren()) do
+		if child:IsA("Frame") then
+			if _scaleInstance then
+				pcall(function() _scaleInstance:Destroy() end)
+			end
+			_scaleInstance = Instance.new("UIScale")
+			_scaleInstance.Scale = factor
+			_scaleInstance.Parent = child
+			break
+		end
+	end
+
+	return factor
+end
+
+-- ═══ TOGGLE SUPPORT ═════════════════════════════════════════════════════
+
+local function hookToggles()
+	local toggles = getgenv().Toggles
+	if not toggles then return end
+
+	for idx, toggle in pairs(toggles) do
+		if not toggle.Container then continue end
+
+		local overlay = createOverlay(toggle.Container, "MO_T_" .. tostring(idx))
+
+		local lastTap = 0
+		overlay.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.Touch then return end
+			local now = tick()
+			if now - lastTap < 0.25 then return end
+			lastTap = now
+			toggle:SetValue(not toggle.Value)
+		end)
+	end
+end
+
+-- ═══ SLIDER SUPPORT ═════════════════════════════════════════════════════
+
+local function findSliderBar(slider)
+	if slider.Display then
+		local frames = findFrameUpvalues(slider.Display)
+		for _, f in ipairs(frames) do
+			local parent = f.Parent
+			if parent and parent:IsA("Frame") and parent.AbsoluteSize.X > 50 then
+				return parent
+			end
+		end
+	end
+
+	if slider.GetValueFromXOffset then
+		local frames = findFrameUpvalues(slider.GetValueFromXOffset)
+		for _, f in ipairs(frames) do
+			if f.AbsoluteSize.X > 50 and f.AbsoluteSize.Y < 30 then
+				return f
+			end
+		end
+	end
+
+	return nil
+end
+
+local function hookSliders()
+	local options = getgenv().Options
+	if not options then return end
+
+	for idx, element in pairs(options) do
+		if element.Type ~= "Slider" then continue end
+
+		local bar = findSliderBar(element)
+		if not bar then continue end
+
+		local overlay = createOverlay(
+			bar, "MO_S_" .. tostring(idx),
+			UDim2.new(1, 16, 1, 20),
+			UDim2.new(0, -8, 0, -10)
+		)
+
+		local dragging = false
+
+		local function updateFromTouch(inputPos)
+			local rel = math.clamp(
+				(inputPos.X - bar.AbsolutePosition.X) / math.max(bar.AbsoluteSize.X, 1),
+				0, 1
+			)
+			local raw = element.Min + (element.Max - element.Min) * rel
+			element:SetValue(roundValue(raw, element.Rounding or 0))
+		end
+
+		overlay.InputBegan:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				dragging = true
+				updateFromTouch(input.Position)
+			end
+		end)
+
+		overlay.InputEnded:Connect(function(input)
+			if input.UserInputType == Enum.UserInputType.Touch then
+				dragging = false
+			end
+		end)
+
+		addConn(UIS.InputChanged:Connect(function(input)
+			if dragging and input.UserInputType == Enum.UserInputType.Touch then
+				updateFromTouch(input.Position)
+			end
+		end))
+	end
+end
+
+-- ═══ DROPDOWN SUPPORT ═══════════════════════════════════════════════════
+
+local function findDropdownHeader(dropdown)
+	local methodsToTry = { "OpenDropdown", "CloseDropdown", "BuildDropdownList" }
+	for _, methodName in ipairs(methodsToTry) do
+		if dropdown[methodName] then
+			local frames = findFrameUpvalues(dropdown[methodName])
+			for _, f in ipairs(frames) do
+				if f:IsA("Frame") and f.AbsoluteSize.Y < 40 and f.AbsoluteSize.X > 60 then
+					return f
+				end
+			end
+		end
+	end
+	return nil
+end
+
+local function hookDropdowns()
+	local options = getgenv().Options
+	if not options then return end
+
+	for idx, element in pairs(options) do
+		if element.Type ~= "Dropdown" then continue end
+
+		local header = findDropdownHeader(element)
+		if not header then continue end
+
+		local overlay = createOverlay(header, "MO_D_" .. tostring(idx))
+
+		overlay.InputBegan:Connect(function(input)
+			if input.UserInputType ~= Enum.UserInputType.Touch then return end
+			pcall(function()
+				if element.OpenDropdown and element.CloseDropdown then
+					element:OpenDropdown()
+				end
+			end)
+		end)
+
+		local scrolling = nil
+		pcall(function()
+			for _, v in pairs(_getupvalues(element.BuildDropdownList or element.OpenDropdown)) do
+				if typeof(v) == "Instance" and v:IsA("ScrollingFrame") then
+					scrolling = v
+					break
+				end
+			end
+		end)
+
+		if scrolling then
+			local function hookItems()
+				for _, child in ipairs(scrolling:GetChildren()) do
+					if (child:IsA("TextLabel") or child:IsA("TextButton") or child:IsA("Frame"))
+						and not child:FindFirstChild("MO_DI") then
+						local itemOverlay = createOverlay(child, "MO_DI")
+						itemOverlay.InputBegan:Connect(function(input)
+							if input.UserInputType == Enum.UserInputType.Touch then
+								local text = nil
+								if child:IsA("TextLabel") or child:IsA("TextButton") then
+									text = child.Text
+								else
+									local label = child:FindFirstChildWhichIsA("TextLabel")
+									if label then text = label.Text end
+								end
+								if text and text ~= "" then
+									pcall(function() element:SetValue(text) end)
+									pcall(function() element:CloseDropdown() end)
+								end
+							end
+						end)
+					end
+				end
+			end
+			hookItems()
+			addConn(scrolling.ChildAdded:Connect(function()
+				task.wait()
+				hookItems()
+			end))
+		end
+	end
+end
+
+-- ═══ KEYBIND HANDLING ═══════════════════════════════════════════════════
+
+local function hideKeybinds()
+	local options = getgenv().Options
+	if not options then return end
+
+	for _, element in pairs(options) do
+		if element.Type ~= "KeyPicker" then continue end
+		pcall(function()
+			if element.Container then
+				element.Container.Visible = false
+			end
+		end)
+	end
+end
+
+-- ═══ WINDOW DRAG ════════════════════════════════════════════════════════
+
+local function hookWindowDrag(screenGui)
+	local outerFrame = nil
+	for _, child in ipairs(screenGui:GetChildren()) do
+		if child:IsA("Frame") and child.Visible and child.BackgroundTransparency < 1 then
+			outerFrame = child
+			break
+		end
+	end
+	if not outerFrame then return end
+
+	local dragOverlay = createOverlay(
+		outerFrame, "MO_Drag",
+		UDim2.new(1, 0, 0, 32),
+		UDim2.new(0, 0, 0, 0)
+	)
+
+	local dragging = false
+	local dragStart = nil
+	local startPos = nil
+
+	dragOverlay.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = outerFrame.Position
+		end
+	end)
+
+	dragOverlay.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			dragging = false
+		end
+	end)
+
+	addConn(UIS.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.Touch and dragStart then
+			local delta = input.Position - dragStart
+			outerFrame.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end))
+end
+
+-- ═══ FLOATING MENU TOGGLE BUTTON ════════════════════════════════════════
+
+local function addMenuToggleButton(Library, screenGui)
+	local btn = Instance.new("TextButton")
+	btn.Name = "MO_MenuToggle"
+	btn.Text = "≡"
+	btn.Font = Enum.Font.GothamBold
+	btn.TextSize = 22
+	btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+	btn.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+	btn.BackgroundTransparency = 0.25
+	btn.Size = UDim2.new(0, 46, 0, 46)
+	btn.Position = UDim2.new(0, 12, 0.5, -23)
+	btn.ZIndex = 200
+	btn.AutoButtonColor = false
+	btn.BorderSizePixel = 0
+	btn.Parent = screenGui
+	addOverlay(btn)
+
+	local corner = Instance.new("UICorner")
+	corner.CornerRadius = UDim.new(0, 10)
+	corner.Parent = btn
+
+	local stroke = Instance.new("UIStroke")
+	stroke.Color = Color3.fromRGB(80, 80, 80)
+	stroke.Thickness = 1
+	stroke.Parent = btn
+
+	local dragging = false
+	local dragStart = nil
+	local startPos = nil
+	local dragDelta = 0
+
+	btn.InputBegan:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			dragging = true
+			dragStart = input.Position
+			startPos = btn.Position
+			dragDelta = 0
+		end
+	end)
+
+	btn.InputEnded:Connect(function(input)
+		if input.UserInputType == Enum.UserInputType.Touch then
+			if dragDelta < 12 then
+				pcall(function()
+					local outerFrame = nil
+					for _, child in ipairs(screenGui:GetChildren()) do
+						if child:IsA("Frame") and child.Name ~= "MO_MenuToggle" then
+							outerFrame = child
+							break
+						end
+					end
+					if outerFrame then
+						outerFrame.Visible = not outerFrame.Visible
+					end
+				end)
+			end
+			dragging = false
+		end
+	end)
+
+	addConn(UIS.InputChanged:Connect(function(input)
+		if dragging and input.UserInputType == Enum.UserInputType.Touch and dragStart then
+			local delta = input.Position - dragStart
+			dragDelta = delta.Magnitude
+			btn.Position = UDim2.new(
+				startPos.X.Scale, startPos.X.Offset + delta.X,
+				startPos.Y.Scale, startPos.Y.Offset + delta.Y
+			)
+		end
+	end))
+end
+
+-- ═══ VIEWPORT CHANGE HANDLER ════════════════════════════════════════════
+
+local function watchViewport(screenGui)
+	addConn(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+		applyScale(screenGui)
+	end))
+end
+
+-- ═══ PUBLIC API ═════════════════════════════════════════════════════════
+
+function MobileSupport.Init(Library)
+	if not MobileSupport.isMobile() then return end
+	if _initialized then return end
+	_initialized = true
+
+	local screenGui = Library.ScreenGui
+	if not screenGui then
+		warn("[MobileSupport] Library.ScreenGui not found")
+		return
+	end
+
+	applyScale(screenGui)
+	task.wait(0.15)
+
+	hookToggles()
+	hookSliders()
+	hookDropdowns()
+	hideKeybinds()
+	hookWindowDrag(screenGui)
+	addMenuToggleButton(Library, screenGui)
+	watchViewport(screenGui)
+end
+
+function MobileSupport.Destroy()
+	_initialized = false
+	for _, conn in ipairs(_connections) do
+		pcall(function() conn:Disconnect() end)
+	end
+	for _, obj in ipairs(_overlays) do
+		pcall(function() obj:Destroy() end)
+	end
+	if _scaleInstance then
+		pcall(function() _scaleInstance:Destroy() end)
+		_scaleInstance = nil
+	end
+	table.clear(_connections)
+	table.clear(_overlays)
+end
+
+return MobileSupport
